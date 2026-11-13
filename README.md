@@ -16,7 +16,7 @@ Written with Google Gemini and Anthropic Claude, prompted by Mark J. Colombo of 
 - ATSC 3.0 PLP status, color-coded by lock state, plus a detailed PLP and L1 screen with SNR requirements that you can save to a text file
 - Channel stepping and seeking, manual tuning by channel or frequency, ATSC 3.0 PLP selection, and switching channel maps
 - Live viewing in VLC
-- 30-second captures: transport streams (ATSC 1.0), and HDHomeRun debug or ALP-PCAP files (ATSC 3.0). The "error checking" capture modes restart automatically until they get a clean 30 seconds. ATSC 3.0 captures also save a matching `.txt` file of PLP and L1 details, ready to feed into [RENDER](https://github.com/YOUR-USERNAME/render)
+- 30-second captures: transport streams (ATSC 1.0), and HDHomeRun debug or ALP-PCAP files (ATSC 3.0). The "error checking" capture modes restart automatically until they get a clean 30 seconds. ATSC 3.0 captures also save a matching `.txt` file of PLP and L1 details, ready to feed into [RENDER](https://github.com/TripEricson/render)
 
 ## Building
 
@@ -39,7 +39,7 @@ brew install ncurses
 
 Then:
 ```bash
-git clone https://github.com/YOUR-USERNAME/hdhomerun_tui.git
+git clone https://github.com/TripEricson/hdhomerun_tui.git
 cd hdhomerun_tui
 git clone https://github.com/Silicondust/libhdhomerun.git
 make
@@ -49,7 +49,7 @@ make
 
 ### USB tuners (optional)
 
-USB tuners based on the Sony CXD28xx chips, such as the GT Media/Zenview HDTV Mate, need the out-of-tree cxd28xx driver with raw ALP support from [YOUR-USERNAME/cxd28xx](https://github.com/TripEricson/cxd28xx), a fork of [majortom9/cxd28xx](https://github.com/majortom9/cxd28xx) that adds the `/dev/alpraw` device. See that repo's README for setup, including the udev rule. The TUI uses `/dev/dvb` and `/dev/alpraw`. If no such tuner is present, the TUI simply doesn't list one.
+USB tuners based on the Sony CXD28xx chips, such as the GT Media/Zenview HDTV Mate, need the out-of-tree cxd28xx driver with raw ALP support from [TripEricson/cxd28xx](https://github.com/TripEricson/cxd28xx), a fork of [majortom9/cxd28xx](https://github.com/majortom9/cxd28xx) that adds the `/dev/alpraw` device. See that repo's README for setup, including the udev rule. The TUI uses `/dev/dvb` and `/dev/alpraw`. If no such tuner is present, the TUI simply doesn't list one.
 
 ## Usage
 
