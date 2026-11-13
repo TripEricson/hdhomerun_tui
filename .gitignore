@@ -1,3 +1,4 @@
 *.o
 hdhomerun_tui
+mousecontrol.txt
 libhdhomerun/

@@ -3,7 +3,7 @@
 # Compiler and flags
 CC = gcc
 CFLAGS = -Wall -I./libhdhomerun
-LDFLAGS = -lncurses -lpthread
+LDFLAGS = -lncurses -lpthread -lm
 
 # OS Detection
 OS := $(shell uname -s)
@@ -40,7 +40,12 @@ LIB_SRCS = $(LIB_SRCS_BASE) $(IF_DETECT_SRC)
 LIB_OBJS = $(LIB_SRCS:.c=.o)
 
 # Source files for the TUI application
-APP_SRCS = hdhomerun_tui.c l1_detail_parser.c
+# hdhomerun_tui.c, l1_details.c and tuner.c use only the common tuner
+# interface. Backends: tuner_hdhr.c (the only file that uses libhdhomerun)
+# and tuner_cxd28xx.c (USB tuners on the cxd28xx driver, via /dev/dvb and
+# /dev/alpraw).
+APP_SRCS = hdhomerun_tui.c l1_detail_parser.c l1_details.c tuner.c tuner_hdhr.c tuner_cxd28xx.c
+APP_HDRS = l1_detail_parser.h l1_details.h tuner.h atsc3_tables.h alp_raw.h
 APP_OBJS = $(APP_SRCS:.c=.o)
 
 # Default target
@@ -51,7 +56,7 @@ $(TARGET): $(APP_OBJS) $(LIB_OBJS)
 	$(CC) $(CFLAGS) -o $(TARGET) $(APP_OBJS) $(LIB_OBJS) $(LDFLAGS)
 
 # Rule to compile a .c file into a .o file
-%.o: %.c
+%.o: %.c $(APP_HDRS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Clean up build files

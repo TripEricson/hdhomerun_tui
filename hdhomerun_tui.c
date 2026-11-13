@@ -2,6 +2,8 @@
  * hdhomerun_tui.c
  *
  * An ncurses-based command-line tool for interacting with HDHomeRun devices.
+ * All tuner access goes through the common interface in tuner.h; the
+ * HDHomeRun specifics are in tuner_hdhr.c.
  *
  * To compile, you'll need the libhdhomerun source code in a subdirectory
  * named "libhdhomerun" and the ncurses development library installed.
@@ -52,10 +54,8 @@
 #include <sys/wait.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include "hdhomerun.h"
-#include "hdhomerun_device.h"
 
-// Headers for native TCP/HTTP download
+// Headers for UDP port selection (VLC viewing)
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -63,7 +63,8 @@
 #include <fcntl.h>
 #include <errno.h>
 
-#include "l1_detail_parser.h"
+#include "l1_details.h"
+#include "tuner.h"
 
 #define MAX_DEVICES 10
 #define MAX_TUNERS_TOTAL 32 // Max combined tuners from all devices
@@ -74,16 +75,9 @@
 #define MAX_MAPS 20 // Maximum number of channel maps supported
 #define MAX_PROGRAMS 128
 
-static const char* TUI_VERSION = "0.9.0";
+static const char* TUI_VERSION = "0.9.1";
 
-// A struct to hold information about a single, unique tuner
-struct unified_tuner {
-    uint32_t device_id;
-    char ip_str[64];
-    int tuner_index;
-    int total_tuners_on_device;
-    bool is_legacy;
-};
+// Each selectable tuner is a struct tuner_info (tuner.h)
 
 // A struct to hold the parsed channel list for a tuner
 struct channel_list {
@@ -108,24 +102,23 @@ enum save_mode {
 };
 
 // Function Prototypes
-int discover_and_build_tuner_list(struct unified_tuner tuners[]);
+int discover_and_build_tuner_list(struct tuner_info tuners[]);
 void draw_signal_bar(WINDOW *win, int y, int x, const char *label, int percentage, int db_value, const char* db_unit);
 void print_line_in_box(WINDOW *win, int y, int x, const char *fmt, ...);
-int draw_status_pane(WINDOW *win, struct hdhomerun_device_t *hd, struct unified_tuner *tuner_info, int scroll_offset);
+int draw_status_pane(WINDOW *win, struct tuner *t, int scroll_offset);
 int show_help_screen(WINDOW *parent_win);
-char* save_stream(struct hdhomerun_device_t *hd, WINDOW *win, enum save_mode mode, struct unified_tuner *tuner_info, bool debug_enabled);
+char* save_stream(struct tuner *t, WINDOW *win, enum save_mode mode, bool debug_enabled);
 int main_loop(void);
 int compare_channels(const void *a, const void *b);
 int compare_plps(const void *a, const void *b);
-void populate_channel_list(struct hdhomerun_device_t *hd, struct channel_list *list);
-long parse_db_value(const char *status_str, const char *key);
+void populate_channel_list(struct tuner *t, struct channel_list *list);
 long parse_status_value(const char *status_str, const char *key);
-char* stream_to_vlc(struct hdhomerun_device_t *hd, WINDOW *win, pid_t *vlc_pid, struct unified_tuner *tuner_info);
-int select_program_menu(WINDOW *win, char *streaminfo_str, char *selected_program_str, int *selected_plp);
+char* stream_to_vlc(struct tuner *t, WINDOW *win, pid_t *vlc_pid);
+int select_program_menu(WINDOW *win, const char *streaminfo_str, char *selected_program_str, int *selected_plp);
 int get_udp_port();
-int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd, struct unified_tuner *tuner_info);
-void add_manual_device(WINDOW *win, struct unified_tuner tuners[], int *total_tuners);
-int http_save_stream(const char *ip_addr, const char *url, const char *filename, WINDOW *win, struct hdhomerun_device_t *hd, struct unified_tuner *tuner_info, bool autorestart_enabled, int save_attempts, int max_save_attempts, bool *out_aborted, bool *out_error_detected, bool debug_enabled);
+int show_plp_details_screen(WINDOW *parent_win, struct tuner *t);
+void add_manual_device(WINDOW *win, struct tuner_info tuners[], int *total_tuners);
+int run_capture(struct tuner *t, enum tuner_capture_format fmt, unsigned rf_channel, const char *plp_str, const char *filename, WINDOW *win, bool autorestart_enabled, int save_attempts, int max_save_attempts, bool *out_aborted, bool *out_error_detected, bool debug_enabled, char *err, size_t errlen);
 
 // Global variable to hold initial IP from command line (-i option)
 static char *g_initial_ip = NULL;
@@ -135,109 +128,24 @@ static char *g_initial_ip = NULL;
  * Queries a device by IP and adds its tuners to the list. No UI required.
  * Returns the number of tuners added, or 0 on failure.
  */
-int add_device_by_ip(const char *ip_str, struct unified_tuner tuners[], int *total_tuners) {
-    if (*total_tuners >= MAX_TUNERS_TOTAL) {
-        return 0;
-    }
-
-    struct hdhomerun_device_t *hd = hdhomerun_device_create_from_str(ip_str, NULL);
-    if (!hd) {
-        return 0;
-    }
-
-    char *model_str;
-    if (hdhomerun_device_get_var(hd, "/sys/model", &model_str, NULL) <= 0) {
-        hdhomerun_device_destroy(hd);
-        return 0;
-    }
-
-    uint32_t device_id = hdhomerun_device_get_device_id(hd);
-    
-    // Check for duplicates
-    for (int i = 0; i < *total_tuners; i++) {
-        if (tuners[i].device_id == device_id) {
-            hdhomerun_device_destroy(hd);
-            return 0;
-        }
-    }
-
-    // Determine if legacy (heuristic based on model string)
-    bool is_legacy = (strstr(model_str, "hdhomerun3") != NULL || strstr(model_str, "hdhomerun_") != NULL);
-    
-    // Count tuners by probing
-    int device_tuner_count = 0;
-    for (int i = 0; i < 8; i++) {
-        if (hdhomerun_device_set_tuner(hd, i) < 0) break;
-        
-        struct hdhomerun_tuner_status_t status;
-        char *status_str;
-        if (hdhomerun_device_get_tuner_status(hd, &status_str, &status) <= 0) break;
-        
-        device_tuner_count++;
-    }
-
+int add_device_by_ip(const char *ip_str, struct tuner_info tuners[], int *total_tuners) {
     int added = 0;
-    if (device_tuner_count > 0) {
-        for (int i = 0; i < device_tuner_count && *total_tuners < MAX_TUNERS_TOTAL; i++) {
-            tuners[*total_tuners].device_id = device_id;
-            strncpy(tuners[*total_tuners].ip_str, ip_str, sizeof(tuners[*total_tuners].ip_str) - 1);
-            tuners[*total_tuners].ip_str[sizeof(tuners[*total_tuners].ip_str) - 1] = '\0';
-            tuners[*total_tuners].tuner_index = i;
-            tuners[*total_tuners].total_tuners_on_device = device_tuner_count;
-            tuners[*total_tuners].is_legacy = is_legacy;
-            (*total_tuners)++;
-            added++;
-        }
-    }
-
-    hdhomerun_device_destroy(hd);
+    uint32_t device_id;
+    tuner_add_by_address(ip_str, tuners, total_tuners, MAX_TUNERS_TOTAL, &added, &device_id);
     return added;
 }
 
 /*
  * discover_and_build_tuner_list
- * Finds HDHomeRun devices and populates a flat list of all available tuners.
+ * Finds tuners (all backends) and populates a flat list of them.
  */
-int discover_and_build_tuner_list(struct unified_tuner tuners[]) {
+int discover_and_build_tuner_list(struct tuner_info tuners[]) {
     clear();
-    mvprintw(0, 0, "Discovering HDHomeRun devices...");
+    mvprintw(0, 0, "Discovering tuners...");
     refresh();
 
-    struct hdhomerun_discover_t *ds = hdhomerun_discover_create(NULL);
-    if (!ds) return 0;
+    int total_tuner_count = tuner_discover(tuners, MAX_TUNERS_TOTAL);
 
-    uint32_t device_types[1] = { HDHOMERUN_DEVICE_TYPE_TUNER };
-    if (hdhomerun_discover2_find_devices_broadcast(ds, HDHOMERUN_DISCOVER_FLAGS_IPV4_GENERAL, device_types, 1) < 0) {
-        hdhomerun_discover_destroy(ds);
-        return 0;
-    }
-
-    int total_tuner_count = 0;
-    struct hdhomerun_discover2_device_t *device = hdhomerun_discover2_iter_device_first(ds);
-    while (device && total_tuner_count < MAX_TUNERS_TOTAL) {
-        uint32_t device_id = hdhomerun_discover2_device_get_device_id(device);
-        int tuner_count = hdhomerun_discover2_device_get_tuner_count(device);
-        bool is_legacy = hdhomerun_discover2_device_is_legacy(device);
-        char ip_str[64];
-
-        struct hdhomerun_discover2_device_if_t *device_if = hdhomerun_discover2_iter_device_if_first(device);
-        struct sockaddr_storage ip_address;
-        hdhomerun_discover2_device_if_get_ip_addr(device_if, &ip_address);
-        hdhomerun_sock_sockaddr_to_ip_str(ip_str, (struct sockaddr *)&ip_address, true);
-
-        for (int i = 0; i < tuner_count && total_tuner_count < MAX_TUNERS_TOTAL; i++) {
-            tuners[total_tuner_count].device_id = device_id;
-            strcpy(tuners[total_tuner_count].ip_str, ip_str);
-            tuners[total_tuner_count].tuner_index = i;
-            tuners[total_tuner_count].total_tuners_on_device = tuner_count;
-            tuners[total_tuner_count].is_legacy = is_legacy;
-            total_tuner_count++;
-        }
-
-        device = hdhomerun_discover2_iter_device_next(device);
-    }
-
-    hdhomerun_discover_destroy(ds);
     clear();
     refresh();
     return total_tuner_count;
@@ -288,21 +196,6 @@ void print_line_in_box(WINDOW *win, int y, int x, const char *fmt, ...) {
 }
 
 /*
- * parse_db_value
- * Helper to find a dB value from a key like "ss=100(-35dBm)".
- */
-long parse_db_value(const char *status_str, const char *key) {
-    const char *key_found = strstr(status_str, key);
-    if (key_found) {
-        const char *paren_open = strchr(key_found, '(');
-        if (paren_open) {
-            return strtol(paren_open + 1, NULL, 10);
-        }
-    }
-    return -999; // Sentinel for not found
-}
-
-/*
  * parse_status_value
  * Helper to find a numeric value for a given key in the raw status string.
  * It now uses base 0 for strtol to auto-detect hex (0x) and decimal.
@@ -322,30 +215,29 @@ long parse_status_value(const char *status_str, const char *key) {
  * Fetches and displays the status of a tuner in a dedicated sub-window.
  * Returns the total number of content lines, for scrolling purposes.
  */
-int draw_status_pane(WINDOW *win, struct hdhomerun_device_t *hd, struct unified_tuner *tuner_info, int scroll_offset) {
+int draw_status_pane(WINDOW *win, struct tuner *t, int scroll_offset) {
     werase(win);
     box(win, 0, 0);
     
-    if (!hd || !tuner_info) {
+    if (!t) {
         mvwprintw(win, 1, 2, "No Tuner Selected");
         return 0;
     }
 
-    char title[128];
-    sprintf(title, " Tuner %08X-%d (%s) Status ", tuner_info->device_id, tuner_info->tuner_index, tuner_info->ip_str);
+    char title[160];
+    snprintf(title, sizeof(title), " %s Status ", tuner_get_info(t)->title);
     mvwprintw(win, 0, 2, "%s", title);
 
-    struct hdhomerun_tuner_status_t status;
-    char *raw_status_str;
+    struct tuner_status status;
     bool is_atsc3 = false;
     int total_content_lines = 0;
     int y = 2; // Start drawing at line 2
 
-    if (hdhomerun_device_get_tuner_status(hd, &raw_status_str, &status) > 0) {
-        long bps = parse_status_value(raw_status_str, "bps=");
-        long pps = parse_status_value(raw_status_str, "pps=");
-        long rssi = parse_db_value(raw_status_str, "ss=");
-        long snr = parse_db_value(raw_status_str, "snq=");
+    if (tuner_get_status(t, &status) > 0) {
+        long bps = status.bps;
+        long pps = status.pps;
+        long rssi = status.strength_dbm;
+        long snr = status.snr_db;
 
         total_content_lines = 11; // Base number of lines for the top section
 
@@ -385,10 +277,10 @@ int draw_status_pane(WINDOW *win, struct hdhomerun_device_t *hd, struct unified_
         const char *id_label = is_atsc3 ? "BSID" : "TSID";
         long id_val = -999;
         
-        char *streaminfo;
-        if (hdhomerun_device_get_tuner_streaminfo(hd, &streaminfo) > 0) id_val = parse_status_value(streaminfo, "tsid=");
-        char *plpinfo;
-        if (is_atsc3 && hdhomerun_device_get_tuner_plpinfo(hd, &plpinfo) > 0) {
+        const char *streaminfo;
+        if (tuner_get_streaminfo(t, &streaminfo) > 0) id_val = parse_status_value(streaminfo, "tsid=");
+        const char *plpinfo;
+        if (is_atsc3 && tuner_get_plpinfo(t, &plpinfo) > 0) {
             long bsid = parse_status_value(plpinfo, "bsid=");
             if (bsid != -999) id_val = bsid;
         }
@@ -401,26 +293,27 @@ int draw_status_pane(WINDOW *win, struct hdhomerun_device_t *hd, struct unified_
         if (y - scroll_offset > 0) { draw_signal_bar(win, y - scroll_offset, 2, "Signal Quality", status.signal_to_noise_quality, snr, "dB "); } y++;
         if (y - scroll_offset > 0) { draw_signal_bar(win, y - scroll_offset, 2, "Symbol Quality", status.symbol_error_quality, -999, ""); } y++;
         
-        double mbps = (pps > 0 && bps != -999) ? (double)bps / 1000000.0 : 0.0;
+        // pps not reported (local tuners): bps is the decoded PLPs' bitrate
+        double mbps = ((pps > 0 || pps == TUNER_NO_VALUE) && bps != TUNER_NO_VALUE) ? (double)bps / 1000000.0 : 0.0;
         if (y - scroll_offset > 0) { print_line_in_box(win, y - scroll_offset, 2, "%-18s: %.3f Mbps", "Network Rate", mbps); } y++;
 
-        char *target_str;
-        if (hdhomerun_device_get_tuner_target(hd, &target_str) > 0) {
+        const char *target_str;
+        if (tuner_get_target(t, &target_str) > 0) {
             if (y - scroll_offset > 0) { print_line_in_box(win, y - scroll_offset, 2, "%-18s: %s", "Network Target", target_str); } y++;
         }
         
         if (y - scroll_offset > 0) { mvwhline(win, y - scroll_offset, 2, ACS_HLINE, getmaxx(win) - 4); } y++;
+        int y_after_divider = y; // nothing drawn below it yet
 
-        struct hdhomerun_tuner_vstatus_t vstatus;
-        char *vstatus_str;
-        if (hdhomerun_device_get_tuner_vstatus(hd, &vstatus_str, &vstatus) > 0 && strlen(vstatus.vchannel) > 0) {
+        struct tuner_vstatus vstatus;
+        if (tuner_get_vstatus(t, &vstatus) > 0) {
             total_content_lines += 2;
             if (y - scroll_offset > 0) { print_line_in_box(win, y - scroll_offset, 2, "Virtual Channel: %s", vstatus.vchannel); } y++;
             if (y - scroll_offset > 0) { print_line_in_box(win, y - scroll_offset, 2, "Name: %s", vstatus.name); } y++;
         }
         
-        char *streaminfo_prog;
-        if (hdhomerun_device_get_tuner_streaminfo(hd, &streaminfo_prog) > 0) {
+        const char *streaminfo_prog;
+        if (tuner_get_streaminfo(t, &streaminfo_prog) > 0) {
             char *programs[MAX_PROGRAMS];
             int program_count = 0;
             char *streaminfo_copy = strdup(streaminfo_prog);
@@ -486,10 +379,21 @@ int draw_status_pane(WINDOW *win, struct hdhomerun_device_t *hd, struct unified_
             }
 
             for (int i = 0; i < program_count; i++) free(programs[i]);
+        } else if (!(tuner_caps(t) & TUNER_CAP_PROGRAMS)) {
+            // Keep the section in place for tuners that can't list programs yet
+            total_content_lines += 2;
+            if (y - scroll_offset > 0 && (y - scroll_offset) < getmaxy(win) - 2) {
+                print_line_in_box(win, y - scroll_offset, 2, "Programs:");
+            }
+            y++;
+            if (y - scroll_offset > 0 && (y - scroll_offset) < getmaxy(win) - 2) {
+                print_line_in_box(win, y - scroll_offset, 4, "Not Supported");
+            }
+            y++;
         }
         
-        char *plpinfo_str;
-        if (is_atsc3 && hdhomerun_device_get_tuner_plpinfo(hd, &plpinfo_str) > 0) {
+        const char *plpinfo_str;
+        if (is_atsc3 && tuner_get_plpinfo(t, &plpinfo_str) > 0) {
             struct plp_line plp_lines[MAX_PLPS];
             int plp_count = 0;
             char *plpinfo_copy = strdup(plpinfo_str);
@@ -508,11 +412,15 @@ int draw_status_pane(WINDOW *win, struct hdhomerun_device_t *hd, struct unified_
             }
 
             if (plp_count > 0) {
-                total_content_lines += 2 + plp_count;
-                if (y - scroll_offset > 0 && (y - scroll_offset) < getmaxy(win) - 2) {
-                    mvwhline(win, y - scroll_offset, 2, ACS_HLINE, getmaxx(win) - 4);
+                // A divider, unless nothing (no programs) came after the last one
+                bool divider = (y != y_after_divider);
+                total_content_lines += (divider ? 2 : 1) + plp_count;
+                if (divider) {
+                    if (y - scroll_offset > 0 && (y - scroll_offset) < getmaxy(win) - 2) {
+                        mvwhline(win, y - scroll_offset, 2, ACS_HLINE, getmaxx(win) - 4);
+                    }
+                    y++;
                 }
-                y++;
                 if (y - scroll_offset > 0 && (y - scroll_offset) < getmaxy(win) - 2) {
                     print_line_in_box(win, y - scroll_offset, 2, "PLP Info:");
                 }
@@ -559,23 +467,8 @@ int compare_plps(const void *a, const void *b) {
  * populate_channel_list
  * Gets the tuner's channel map, parses it, and stores a sorted list of channels.
  */
-void populate_channel_list(struct hdhomerun_device_t *hd, struct channel_list *list) {
-    list->count = 0;
-    char *map_str;
-    if (hdhomerun_device_get_tuner_channelmap(hd, &map_str) <= 0) return;
-
-    char *map_copy = strdup(map_str);
-    if (!map_copy) return;
-
-    char *token = strtok(map_copy, " ");
-    token = strtok(NULL, " "); 
-
-    while (token != NULL && list->count < MAX_CHANNELS) {
-        list->channels[list->count++] = (unsigned int)strtoul(token, NULL, 10);
-        token = strtok(NULL, " ");
-    }
-    free(map_copy);
-    if (list->count > 0) qsort(list->channels, list->count, sizeof(unsigned int), compare_channels);
+void populate_channel_list(struct tuner *t, struct channel_list *list) {
+    list->count = tuner_get_channel_list(t, list->channels, MAX_CHANNELS);
 }
 
 /*
@@ -677,82 +570,48 @@ int show_help_screen(WINDOW *parent_win) {
 }
 
 /*
- * http_save_stream
- * Performs a download of an HTTP stream using native sockets, replacing wget.
- * Returns 0 on success, -1 on failure.
+ * run_capture
+ * Runs a device-timed capture (ATSC 3.0 .dbg / ALP pcap) into a file, with
+ * the status pane updating. The tuner ends the capture after 30 seconds.
+ * Returns 0 on success, -1 on failure (message in err).
  */
-int http_save_stream(const char *ip_addr, const char *url, const char *filename, WINDOW *win, struct hdhomerun_device_t *hd, struct unified_tuner *tuner_info, bool autorestart_enabled, int save_attempts, int max_save_attempts, bool *out_aborted, bool *out_error_detected, bool debug_enabled) {
+int run_capture(struct tuner *t, enum tuner_capture_format fmt, unsigned rf_channel, const char *plp_str, const char *filename, WINDOW *win, bool autorestart_enabled, int save_attempts, int max_save_attempts, bool *out_aborted, bool *out_error_detected, bool debug_enabled, char *err, size_t errlen) {
     *out_aborted = false;
     *out_error_detected = false;
 
-    // 1. Create and connect socket
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    int rcvbuf_size = 2 * 1024 * 1024;
-    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size));
-    if (sock < 0) {
-        print_line_in_box(win, LINES - 3, 2, "Error: Could not create socket."); wrefresh(win); sleep(2);
+    char url[256];
+    struct tuner_capture *cap = tuner_capture_start(t, fmt, rf_channel, plp_str, 30, url, sizeof(url), err, errlen);
+    if (!cap) {
+        print_line_in_box(win, LINES - 3, 2, "%s", err); wrefresh(win); sleep(2);
         return -1;
     }
 
-    struct sockaddr_in serv_addr;
-    memset(&serv_addr, 0, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(5004);
-    if (inet_pton(AF_INET, ip_addr, &serv_addr.sin_addr) <= 0) {
-        print_line_in_box(win, LINES - 3, 2, "Error: Invalid IP address."); wrefresh(win); sleep(2);
-        close(sock);
-        return -1;
-    }
-
-    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        print_line_in_box(win, LINES - 3, 2, "Error: Could not connect to device."); wrefresh(win); sleep(2);
-        close(sock);
-        return -1;
-    }
-
-    // 2. Send HTTP GET request
-    const char *path_start = strstr(url, "/tuner");
-    if (!path_start) {
-        print_line_in_box(win, LINES - 3, 2, "Error: Invalid URL for request."); wrefresh(win); sleep(2);
-        close(sock);
-        return -1;
-    }
-    char request[512];
-    snprintf(request, sizeof(request), "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", path_start, ip_addr);
-    if (send(sock, request, strlen(request), 0) < 0) {
-        print_line_in_box(win, LINES - 3, 2, "Error: Failed to send request."); wrefresh(win); sleep(2);
-        close(sock);
-        return -1;
-    }
-
-    // 3. Open output file
     FILE *f = fopen(filename, "wb");
     if (!f) {
-        print_line_in_box(win, LINES - 3, 2, "Error: Failed to open file for writing."); wrefresh(win); sleep(2);
-        close(sock);
+        snprintf(err, errlen, "Error: Failed to open file for writing.");
+        print_line_in_box(win, LINES - 3, 2, "%s", err); wrefresh(win); sleep(2);
+        tuner_capture_stop(cap);
         return -1;
     }
 
-    // 4. Receive data in a non-blocking loop
-    // The server handles the duration via the duration= parameter in the URL.
-    // We wait for the server to close the connection, with a safety timeout.
-    fcntl(sock, F_SETFL, O_NONBLOCK);
+    // The tuner handles the duration; wait for it to end the capture, with
+    // a safety timeout.
     struct timespec start_time, current_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);
     long elapsed_ms = 0;
-    const long safety_timeout_ms = 45000; // Safety timeout in case server doesn't close
+    const long safety_timeout_ms = 45000; // Safety timeout in case the tuner doesn't end it
     const long expected_duration_ms = 30000; // Expected duration for UI display
-    bool headers_processed = false;
-    char buffer[65536]; // Increased buffer size
+    static uint8_t buffer[65536];
+    bool finished = false;
     
-    while (elapsed_ms < safety_timeout_ms) {
+    while (elapsed_ms < safety_timeout_ms && !finished) {
         clock_gettime(CLOCK_MONOTONIC, &current_time);
         elapsed_ms = (current_time.tv_sec - start_time.tv_sec) * 1000 + (current_time.tv_nsec - start_time.tv_nsec) / 1000000;
         long remaining_s = (expected_duration_ms - elapsed_ms) / 1000;
         if (remaining_s < 0) remaining_s = 0;
 
         // Update UI
-        draw_status_pane(win, hd, tuner_info, 0);
+        draw_status_pane(win, t, 0);
         mvwhline(win, LINES - 5, 1, ' ', getmaxx(win) - 2);
         mvwhline(win, LINES - 4, 1, ' ', getmaxx(win) - 2);
         mvwhline(win, LINES - 3, 1, ' ', getmaxx(win) - 2);
@@ -785,9 +644,8 @@ int http_save_stream(const char *ip_addr, const char *url, const char *filename,
 
         // Check for signal errors if autorestart is on (only during expected capture time)
         if (autorestart_enabled && (elapsed_ms >= 2000) && (elapsed_ms < expected_duration_ms)) {
-            struct hdhomerun_tuner_status_t current_status;
-            char *current_raw_status;
-            if (hdhomerun_device_get_tuner_status(hd, &current_raw_status, &current_status) > 0) {
+            struct tuner_status current_status;
+            if (tuner_get_status(t, &current_status) > 0) {
                 if (current_status.symbol_error_quality < 100) {
                     *out_error_detected = true;
                     break;
@@ -795,40 +653,20 @@ int http_save_stream(const char *ip_addr, const char *url, const char *filename,
             }
         }
 
-        // Receive data from socket
-        int bytes_read = recv(sock, buffer, sizeof(buffer), 0);
-        if (bytes_read > 0) {
-            char *data_to_write = buffer;
-            int len_to_write = bytes_read;
-            if (!headers_processed) {
-                char *body_start = strstr(buffer, "\r\n\r\n");
-                if (body_start) {
-                    body_start += 4; // Move pointer past the CRLFCRLF
-                    len_to_write = bytes_read - (body_start - buffer);
-                    data_to_write = body_start;
-                    headers_processed = true;
-                } else {
-                    // Headers not fully received in this chunk, so write nothing yet
-                    len_to_write = 0;
-                }
-            }
-            if (len_to_write > 0) {
-                fwrite(data_to_write, 1, len_to_write, f);
-            }
-        } else if (bytes_read == 0) {
-            // Connection closed by server, successful completion
-            break;
-        } else { // bytes_read < 0
-            if (errno != EWOULDBLOCK && errno != EAGAIN) {
-                // A real error occurred
+        // Write whatever has arrived (bounded, so the UI keeps updating)
+        for (int reads = 0; reads < 64; reads++) {
+            long n = tuner_capture_read(cap, buffer, sizeof(buffer));
+            if (n > 0) {
+                fwrite(buffer, 1, (size_t)n, f);
+            } else {
+                if (n < 0) finished = true;   // ended (or failed): done
                 break;
             }
-            // No data right now, just loop again
         }
     }
 
     fclose(f);
-    close(sock);
+    tuner_capture_stop(cap);
     return 0;
 }
 
@@ -837,10 +675,9 @@ int http_save_stream(const char *ip_addr, const char *url, const char *filename,
  * save_stream
  * Saves a 30-second transport stream capture to a file.
  */
-char* save_stream(struct hdhomerun_device_t *hd, WINDOW *win, enum save_mode mode, struct unified_tuner *tuner_info, bool debug_enabled) {
-    struct hdhomerun_tuner_status_t status;
-    char *raw_status_str;
-    if (hdhomerun_device_get_tuner_status(hd, &raw_status_str, &status) <= 0) {
+char* save_stream(struct tuner *t, WINDOW *win, enum save_mode mode, bool debug_enabled) {
+    struct tuner_status status;
+    if (tuner_get_status(t, &status) <= 0) {
         print_line_in_box(win, LINES - 3, 2, "Failed to get tuner status."); wrefresh(win); sleep(2);
         return NULL;
     }
@@ -856,8 +693,17 @@ char* save_stream(struct hdhomerun_device_t *hd, WINDOW *win, enum save_mode mod
 
     bool is_pcap = (mode == SAVE_NORMAL_PCAP || mode == SAVE_AUTORESTART_PCAP);
     if (is_pcap) {
-        if (parse_db_value(raw_status_str, "ss=") == -999) {
+        if (!(tuner_caps(t) & TUNER_CAP_ALP_PCAP)) {
             print_line_in_box(win, LINES - 3, 2, "PCAP capture not available on this device model."); wrefresh(win); sleep(2);
+            return NULL;
+        }
+    } else {
+        // .dbg (ATSC 3.0) or TS (ATSC 1.0): not every tuner can make them
+        bool want_dbg = (strstr(status.lock_str, "atsc3") != NULL);
+        if (!(tuner_caps(t) & (want_dbg ? TUNER_CAP_DBG : TUNER_CAP_TS))) {
+            print_line_in_box(win, LINES - 3, 2, want_dbg ? "Debug capture not available on this tuner; use x for PCAP."
+                                                         : "TS capture not available on this tuner.");
+            wrefresh(win); sleep(2);
             return NULL;
         }
     }
@@ -868,16 +714,16 @@ char* save_stream(struct hdhomerun_device_t *hd, WINDOW *win, enum save_mode mod
     if (isdigit((unsigned char)*p)) rf_channel = strtoul(p, NULL, 10);
 
     long id_val = 0;
-    char *streaminfo;
-    if (hdhomerun_device_get_tuner_streaminfo(hd, &streaminfo) > 0) {
+    const char *streaminfo;
+    if (tuner_get_streaminfo(t, &streaminfo) > 0) {
         long parsed_id = parse_status_value(streaminfo, "tsid=");
         if (parsed_id != -999) id_val = parsed_id;
     }
     
     bool is_atsc3 = (strstr(status.lock_str, "atsc3") != NULL);
     if (is_atsc3) {
-        char *plpinfo;
-        if (hdhomerun_device_get_tuner_plpinfo(hd, &plpinfo) > 0) {
+        const char *plpinfo;
+        if (tuner_get_plpinfo(t, &plpinfo) > 0) {
             long bsid = parse_status_value(plpinfo, "bsid=");
             if (bsid != -999) id_val = bsid;
         }
@@ -908,7 +754,7 @@ char* save_stream(struct hdhomerun_device_t *hd, WINDOW *win, enum save_mode mod
         }
         
         while(1) { // Loop to allow for auto-restarting
-            const char *format = is_pcap ? "alp-pcap" : "dbg";
+            enum tuner_capture_format format = is_pcap ? CAPTURE_ALP_PCAP : CAPTURE_DBG;
             const char *ext = is_pcap ? ".pcap" : ".dbg";
             
             char plp_str[128] = {0};
@@ -918,8 +764,8 @@ char* save_stream(struct hdhomerun_device_t *hd, WINDOW *win, enum save_mode mod
                 int locked_count = 0;
                 bool plp_locked[MAX_PLPS] = {false};
                 
-                char *plpinfo;
-                if (hdhomerun_device_get_tuner_plpinfo(hd, &plpinfo) > 0) {
+                const char *plpinfo;
+                if (tuner_get_plpinfo(t, &plpinfo) > 0) {
                     char *plpinfo_copy = strdup(plpinfo);
                     if (plpinfo_copy) {
                         // Parse line by line to check lock status
@@ -999,23 +845,24 @@ char* save_stream(struct hdhomerun_device_t *hd, WINDOW *win, enum save_mode mod
             char filename[256];
             char time_str[20];
             time_t now = time(NULL);
-            struct tm *t = localtime(&now);
-            strftime(time_str, sizeof(time_str)-1, "%Y%m%d-%H%M%S", t);
+            struct tm *tm_now = localtime(&now);
+            strftime(time_str, sizeof(time_str)-1, "%Y%m%d-%H%M%S", tm_now);
             sprintf(filename, "rf%u-bsid%ld-%s-%s%s", rf_channel, id_val, plp_str, time_str, ext);
-            
-            char url[256];
-            sprintf(url, "http://%s:5004/tuner%d/ch%u%s?format=%s&duration=30", tuner_info->ip_str, tuner_info->tuner_index, rf_channel, plp_str, format);
             
             bool aborted = false;
             bool error_detected = false;
 
             if (!error_detected) {
-                save_atsc3_details_auto(hd, tuner_info->tuner_index, filename);
+                save_atsc3_details_auto(t, filename);
             }
             
-            // Call the native HTTP download function instead of fork/wget
             // Pass 0 for max_save_attempts to indicate unlimited retries (like ATSC 1.0)
-            http_save_stream(tuner_info->ip_str, url, filename, win, hd, tuner_info, autorestart_enabled, save_attempts, 0, &aborted, &error_detected, debug_enabled);
+            char capture_err[128] = "";
+            if (run_capture(t, format, rf_channel, plp_str, filename, win, autorestart_enabled, save_attempts, 0, &aborted, &error_detected, debug_enabled, capture_err, sizeof(capture_err)) < 0) {
+                result_str = (char*)malloc(512);
+                snprintf(result_str, 512, "Capture failed: %s", capture_err);
+                break;
+            }
 
             if (autorestart_enabled && error_detected) {
                 remove(filename);
@@ -1032,9 +879,8 @@ char* save_stream(struct hdhomerun_device_t *hd, WINDOW *win, enum save_mode mod
                 print_line_in_box(win, LINES - 4, 2, "Symbol Quality error. Restarting capture in 1s..."); wrefresh(win);
                 
                 napms(500);
-                hdhomerun_device_set_tuner_channel(hd, original_channel);
-                struct hdhomerun_tuner_status_t lock_status;
-                hdhomerun_device_wait_for_lock(hd, &lock_status);
+                tuner_set_channel(t, original_channel);
+                tuner_wait_for_lock(t);
                 
                 sleep(1);
                 continue; // Continue the while loop to retry
@@ -1057,28 +903,28 @@ char* save_stream(struct hdhomerun_device_t *hd, WINDOW *win, enum save_mode mod
         char filename[128];
         char time_str[20];
         time_t now = time(NULL);
-        struct tm *t = localtime(&now);
-        strftime(time_str, sizeof(time_str)-1, "%Y%m%d-%H%M%S", t);
+        struct tm *tm_now = localtime(&now);
+        strftime(time_str, sizeof(time_str)-1, "%Y%m%d-%H%M%S", tm_now);
         sprintf(filename, "rf%u-tsid%ld-%s.ts", rf_channel, id_val, time_str);
 
         print_line_in_box(win, LINES - 4, 2, "Starting capture..."); wrefresh(win);
 
-        char debug_path[64];
-        sprintf(debug_path, "/tuner%d/debug", tuner_info->tuner_index);
-        char *debug_str;
-        hdhomerun_device_get_var(hd, debug_path, &debug_str, NULL);
-        long start_te = parse_status_value(debug_str, "te=");
-        long start_ne = parse_status_value(debug_str, "ne=");
-        long start_se = parse_status_value(debug_str, "se=");
+        struct tuner_errors start_err;
+        tuner_get_errors(t, &start_err);
+        long start_te = start_err.transport;
+        long start_ne = start_err.network;
+        long start_se = start_err.sequence;
 
-        if (hdhomerun_device_stream_start(hd) <= 0) {
-            print_line_in_box(win, LINES - 3, 2, "Failed to start stream."); wrefresh(win); sleep(2);
+        char cap_err[128];
+        struct tuner_capture *cap = tuner_capture_start(t, CAPTURE_TS, rf_channel, "", 30, NULL, 0, cap_err, sizeof(cap_err));
+        if (!cap) {
+            print_line_in_box(win, LINES - 3, 2, "%s", cap_err); wrefresh(win); sleep(2);
             return NULL;
         }
 
         FILE *f = fopen(filename, "wb");
         if (!f) {
-            hdhomerun_device_stream_stop(hd);
+            tuner_capture_stop(cap);
             print_line_in_box(win, LINES - 3, 2, "Failed to open file for writing."); wrefresh(win); sleep(2);
             return NULL;
         }
@@ -1096,7 +942,7 @@ char* save_stream(struct hdhomerun_device_t *hd, WINDOW *win, enum save_mode mod
             long remaining_s = (30000 - elapsed_ms) / 1000;
             if (remaining_s < 0) remaining_s = 0;
             
-            draw_status_pane(win, hd, tuner_info, 0);
+            draw_status_pane(win, t, 0);
 
             mvwhline(win, LINES - 4, 1, ' ', getmaxx(win) - 2);
             mvwhline(win, LINES - 3, 1, ' ', getmaxx(win) - 2);
@@ -1104,19 +950,20 @@ char* save_stream(struct hdhomerun_device_t *hd, WINDOW *win, enum save_mode mod
             print_line_in_box(win, LINES - 3, 2, "Press Backspace to stop.");
             wrefresh(win);
 
-            size_t actual_size;
-            uint8_t *video_data = hdhomerun_device_stream_recv(hd, VIDEO_DATA_BUFFER_SIZE_1S, &actual_size);
-
-            if (video_data && actual_size > 0) {
-                fwrite(video_data, 1, actual_size, f);
+            static uint8_t video_data[65536];
+            for (int reads = 0; reads < 64; reads++) {
+                long actual_size = tuner_capture_read(cap, video_data, sizeof(video_data));
+                if (actual_size <= 0) break;
+                fwrite(video_data, 1, (size_t)actual_size, f);
                 total_bytes += actual_size;
             }
 
             if (autorestart_enabled) {
-                hdhomerun_device_get_var(hd, debug_path, &debug_str, NULL);
-                long current_te = parse_status_value(debug_str, "te=");
-                long current_ne = parse_status_value(debug_str, "ne=");
-                long current_se = parse_status_value(debug_str, "se=");
+                struct tuner_errors cur_err;
+                tuner_get_errors(t, &cur_err);
+                long current_te = cur_err.transport;
+                long current_ne = cur_err.network;
+                long current_se = cur_err.sequence;
 
                 if (current_te > start_te || current_ne > start_ne || current_se > start_se) {
                     error_detected = true;
@@ -1130,7 +977,7 @@ char* save_stream(struct hdhomerun_device_t *hd, WINDOW *win, enum save_mode mod
         }
 
         fclose(f);
-        hdhomerun_device_stream_stop(hd);
+        tuner_capture_stop(cap);
         
         if (aborted) {
             result_str = (char*)malloc(512);
@@ -1140,10 +987,11 @@ char* save_stream(struct hdhomerun_device_t *hd, WINDOW *win, enum save_mode mod
             return result_str;
         }
 
-        hdhomerun_device_get_var(hd, debug_path, &debug_str, NULL);
-        long end_te = parse_status_value(debug_str, "te=");
-        long end_ne = parse_status_value(debug_str, "ne=");
-        long end_se = parse_status_value(debug_str, "se=");
+        struct tuner_errors end_err;
+        tuner_get_errors(t, &end_err);
+        long end_te = end_err.transport;
+        long end_ne = end_err.network;
+        long end_se = end_err.sequence;
 
         if (autorestart_enabled && error_detected) {
             remove(filename);
@@ -1166,9 +1014,8 @@ char* save_stream(struct hdhomerun_device_t *hd, WINDOW *win, enum save_mode mod
         // Give the tuner a moment to settle after the capture operation
         napms(500); // Half second delay
         
-        hdhomerun_device_set_tuner_channel(hd, original_channel);
-        struct hdhomerun_tuner_status_t lock_status;
-        hdhomerun_device_wait_for_lock(hd, &lock_status);
+        tuner_set_channel(t, original_channel);
+        tuner_wait_for_lock(t);
         
         return result_str; // May be NULL if there was an early error
     }
@@ -1212,7 +1059,7 @@ int get_udp_port() {
  * Displays a menu of available programs for the user to select.
  * Returns 1 on selection, 0 on cancellation.
  */
-int select_program_menu(WINDOW *win, char *streaminfo_str, char *selected_program_str, int *selected_plp) {
+int select_program_menu(WINDOW *win, const char *streaminfo_str, char *selected_program_str, int *selected_plp) {
     *selected_plp = -1;
     struct program_info {
         char display_str[256];
@@ -1309,29 +1156,29 @@ int select_program_menu(WINDOW *win, char *streaminfo_str, char *selected_progra
  * stream_to_vlc
  * Manages the process of starting and stopping a video stream to VLC.
  */
-char* stream_to_vlc(struct hdhomerun_device_t *hd, WINDOW *win, pid_t *vlc_pid, struct unified_tuner *tuner_info) {
-    char tuner_target_path[64];
-    sprintf(tuner_target_path, "/tuner%d/target", tuner_info->tuner_index);
-
+char* stream_to_vlc(struct tuner *t, WINDOW *win, pid_t *vlc_pid) {
     // If VLC is already running, stop it.
     if (*vlc_pid > 0) {
         kill(*vlc_pid, SIGTERM);
         waitpid(*vlc_pid, NULL, 0);
-        hdhomerun_device_set_var(hd, tuner_target_path, "none", NULL, NULL);
+        tuner_clear_target(t);
         *vlc_pid = 0;
         return strdup("VLC stream stopped.");
     }
 
+    if (!(tuner_caps(t) & TUNER_CAP_VLC)) {
+        return strdup("Live viewing is not supported on this tuner.");
+    }
+
     // Check for signal lock before starting
-    struct hdhomerun_tuner_status_t status;
-    char *raw_status_str;
-    if (hdhomerun_device_get_tuner_status(hd, &raw_status_str, &status) <= 0 || strstr(status.lock_str, "none") != NULL) {
+    struct tuner_status status;
+    if (tuner_get_status(t, &status) <= 0 || strstr(status.lock_str, "none") != NULL) {
         return strdup("No signal lock. Cannot start stream.");
     }
     
     // Get the list of available programs
-    char *streaminfo_str;
-    if (hdhomerun_device_get_tuner_streaminfo(hd, &streaminfo_str) <= 0) {
+    const char *streaminfo_str;
+    if (tuner_get_streaminfo(t, &streaminfo_str) <= 0) {
         return strdup("Failed to get program list.");
     }
 
@@ -1343,9 +1190,7 @@ char* stream_to_vlc(struct hdhomerun_device_t *hd, WINDOW *win, pid_t *vlc_pid, 
     }
     
     // Set the tuner to the selected program
-    char tuner_program_path[64];
-    sprintf(tuner_program_path, "/tuner%d/program", tuner_info->tuner_index);
-    if (hdhomerun_device_set_var(hd, tuner_program_path, selected_program, NULL, NULL) < 0) {
+    if (tuner_set_program(t, selected_program) < 0) {
         char err_msg[128];
         sprintf(err_msg, "Failed to set program to %s.", selected_program);
         return strdup(err_msg);
@@ -1357,42 +1202,10 @@ char* stream_to_vlc(struct hdhomerun_device_t *hd, WINDOW *win, pid_t *vlc_pid, 
         return strdup("Could not find a free UDP port.");
     }
 
-    // Dynamically determine the local IP address that connects to the HDHomeRun
-    char local_ip[INET_ADDRSTRLEN];
-    int temp_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (temp_sock < 0) { return strdup("Socket error determining local IP."); }
-
-    struct sockaddr_in serv;
-    memset(&serv, 0, sizeof(serv));
-    serv.sin_family = AF_INET;
-    serv.sin_port = htons(65001); // Connect to a port on the HDHomeRun to find the interface
-    if (inet_pton(AF_INET, tuner_info->ip_str, &serv.sin_addr) <= 0) {
-        close(temp_sock);
-        return strdup("Invalid device IP address.");
-    }
-
-    if (connect(temp_sock, (const struct sockaddr *)&serv, sizeof(serv)) < 0) {
-        close(temp_sock);
-        return strdup("Connect error determining local IP.");
-    }
-
-    struct sockaddr_in name;
-    socklen_t namelen = sizeof(name);
-    if (getsockname(temp_sock, (struct sockaddr *)&name, &namelen) < 0) {
-        close(temp_sock);
-        return strdup("getsockname error determining local IP.");
-    }
-    close(temp_sock);
-
-    if (inet_ntop(AF_INET, &name.sin_addr, local_ip, sizeof(local_ip)) == NULL) {
-        return strdup("inet_ntop error determining local IP.");
-    }
-
-    // Set the stream target on the tuner
-    char target_str[128];
-    sprintf(target_str, "rtp://%s:%d", local_ip, port);
-    if (hdhomerun_device_set_var(hd, tuner_target_path, target_str, NULL, NULL) < 0) {
-        return strdup("Failed to set stream target.");
+    // Send the program to this computer (the tuner works out the local address)
+    char target_err[128];
+    if (tuner_set_target_rtp(t, port, target_err, sizeof(target_err)) < 0) {
+        return strdup(target_err);
     }
 
     // Fork and execute VLC to listen for the stream
@@ -1424,12 +1237,11 @@ char* stream_to_vlc(struct hdhomerun_device_t *hd, WINDOW *win, pid_t *vlc_pid, 
  * The primary application loop for the unified UI.
  */
 int main_loop() {
-    struct unified_tuner tuners[MAX_TUNERS_TOTAL];
+    struct tuner_info tuners[MAX_TUNERS_TOTAL];
     int total_tuners = 0;
     int highlight = 0;
     
-    struct hdhomerun_device_t *hd = NULL;
-    uint32_t current_device_id = 0;
+    struct tuner *tnr = NULL;           // the open (selected) tuner
 
     struct channel_list chan_list;
     chan_list.count = 0;
@@ -1455,7 +1267,9 @@ int main_loop() {
         clear();
         mvprintw(0, 0, "Connecting to %s...", g_initial_ip);
         refresh();
-        total_tuners = add_device_by_ip(g_initial_ip, tuners, &total_tuners);
+        // Local tuners are listed too (no network discovery needed for them)
+        total_tuners = tuner_discover_local(tuners, MAX_TUNERS_TOTAL);
+        add_device_by_ip(g_initial_ip, tuners, &total_tuners);
         g_initial_ip = NULL; // Clear so subsequent refreshes use discovery
         clear();
         refresh();
@@ -1469,33 +1283,32 @@ int main_loop() {
 
     while (1) {
         bool tuner_changed = false;
-        struct unified_tuner *selected_tuner = (total_tuners > 0) ? &tuners[highlight] : NULL;
+        struct tuner_info *selected_tuner = (total_tuners > 0) ? &tuners[highlight] : NULL;
 
         if (selected_tuner) {
-            if (hd == NULL || current_device_id != selected_tuner->device_id) {
-                if (hd) hdhomerun_device_destroy(hd);
-                // Use IP address to connect - more reliable than device ID lookup
-                // which requires broadcast discovery
-                hd = hdhomerun_device_create_from_str(selected_tuner->ip_str, NULL);
-                current_device_id = selected_tuner->device_id;
+            const struct tuner_info *open_info = tuner_get_info(tnr);
+            if (tnr == NULL || open_info->kind != selected_tuner->kind ||
+                open_info->device_id != selected_tuner->device_id ||
+                open_info->tuner_index != selected_tuner->tuner_index) {
+                // If the tuner changes while VLC is running, stop it, and stop
+                // the stream on the tuner it was coming from.
+                if (tnr && vlc_pid > 0) {
+                    kill(vlc_pid, SIGTERM); waitpid(vlc_pid, NULL, 0); vlc_pid = 0;
+                    tuner_clear_target(tnr);
+                    if (persistent_message) free(persistent_message);
+                    persistent_message = strdup("VLC stopped due to tuner change.");
+                }
+                if (tnr) tuner_close(tnr);
+                tnr = tuner_open(selected_tuner);
                 status_scroll_offset = 0;
                 tuner_changed = true;
             }
-            if (hd) {
-                hdhomerun_device_set_tuner(hd, selected_tuner->tuner_index);
+            if (tnr) {
                 if (chan_list.count == 0 || tuner_changed) {
-                    populate_channel_list(hd, &chan_list);
+                    populate_channel_list(tnr, &chan_list);
                     status_scroll_offset = 0;
                 }
             }
-        }
-        
-        // If tuner changed while VLC was running, stop it.
-        if (tuner_changed && vlc_pid > 0) {
-            kill(vlc_pid, SIGTERM); waitpid(vlc_pid, NULL, 0); vlc_pid = 0;
-            hdhomerun_device_set_tuner_target(hd, "none");
-            if (persistent_message) free(persistent_message);
-            persistent_message = strdup("VLC stopped due to tuner change.");
         }
 
 
@@ -1504,19 +1317,18 @@ int main_loop() {
         for (int i = 0; i < total_tuners; i++) {
             if (i + 2 >= LINES) break;
             if (i == highlight) wattron(tuner_win, A_REVERSE);
-            mvwprintw(tuner_win, i + 1, 2, "%08X-%d", tuners[i].device_id, tuners[i].tuner_index);
+            mvwprintw(tuner_win, i + 1, 2, "%s", tuners[i].name);
             if (i == highlight) wattroff(tuner_win, A_REVERSE);
         }
         mvwprintw(tuner_win, LINES - 2, 2, "r: Refresh");
         
-        total_content_lines = draw_status_pane(status_win, hd, selected_tuner, status_scroll_offset);
+        total_content_lines = draw_status_pane(status_win, tnr, status_scroll_offset);
         
         // Check if current tuner is ATSC3 to adjust hint text
         bool is_atsc3 = false;
-        if(hd) {
-            struct hdhomerun_tuner_status_t current_status;
-            char *raw_status;
-            if(hdhomerun_device_get_tuner_status(hd, &raw_status, &current_status) > 0) {
+        if(tnr) {
+            struct tuner_status current_status;
+            if(tuner_get_status(tnr, &current_status) > 0) {
                 if(strstr(current_status.lock_str, "atsc3")) {
                     is_atsc3 = true;
                 }
@@ -1581,9 +1393,9 @@ int main_loop() {
                 if (vlc_pid > 0) { 
                     kill(vlc_pid, SIGTERM); 
                     waitpid(vlc_pid, NULL, 0); 
-                    hdhomerun_device_set_tuner_target(hd, "none");
+                    tuner_clear_target(tnr);
                 }
-                if (hd) hdhomerun_device_destroy(hd);
+                if (tnr) tuner_close(tnr);
                 delwin(tuner_win); delwin(status_win);
                 return 0;
 
@@ -1592,9 +1404,9 @@ int main_loop() {
                     kill(vlc_pid, SIGTERM); 
                     waitpid(vlc_pid, NULL, 0); 
                     vlc_pid = 0; 
-                    hdhomerun_device_set_tuner_target(hd, "none");
+                    tuner_clear_target(tnr);
                 }
-                if (hd) { hdhomerun_device_destroy(hd); hd = NULL; current_device_id = 0; }
+                if (tnr) { tuner_close(tnr); tnr = NULL; }
                 chan_list.count = 0; status_scroll_offset = 0;
                 total_tuners = discover_and_build_tuner_list(tuners);
                 highlight = 0;
@@ -1611,9 +1423,9 @@ int main_loop() {
             case KEY_NPAGE: if (status_scroll_offset < total_content_lines - (LINES - 4)) status_scroll_offset++; break;
 
             case 'd':
-                if(hd && is_atsc3) {
-                    if (show_plp_details_screen(status_win, hd, selected_tuner) == 1) { // Quit requested
-                         if (hd) hdhomerun_device_destroy(hd);
+                if(tnr && is_atsc3) {
+                    if (show_plp_details_screen(status_win, tnr) == 1) { // Quit requested
+                         if (tnr) tuner_close(tnr);
                          delwin(tuner_win); delwin(status_win);
                          return 0;
                     }
@@ -1621,22 +1433,21 @@ int main_loop() {
                 break;
 
             case 'v':
-                if (!hd) break;
+                if (!tnr) break;
                 if (persistent_message) free(persistent_message);
-                persistent_message = stream_to_vlc(hd, status_win, &vlc_pid, &tuners[highlight]);
+                persistent_message = stream_to_vlc(tnr, status_win, &vlc_pid);
                 break;
 
             case '+':
             case '=':
             case '-':
             case '_':
-                if (!hd) break;
+                if (!tnr) break;
                 {
                     int seek_direction = (ch == '+' || ch == '=') ? 1 : -1;
                     unsigned int current_channel = 0;
-                    struct hdhomerun_tuner_status_t status;
-                    char *s;
-                    if (hdhomerun_device_get_tuner_status(hd, &s, &status) > 0) {
+                    struct tuner_status status;
+                    if (tuner_get_status(tnr, &status) > 0) {
                         char *p = strchr(status.channel, ':');
                         if (!p) p = status.channel; else p++;
                         if (isdigit((unsigned char)*p)) current_channel = strtoul(p, NULL, 10);
@@ -1681,28 +1492,27 @@ int main_loop() {
 
                         char tune_str[64];
                         sprintf(tune_str, "auto:%u", new_channel);
-                        hdhomerun_device_set_tuner_channel(hd, tune_str);
+                        tuner_set_channel(tnr, tune_str);
                         status_scroll_offset = 0;
                         
                         wmove(status_win, LINES - 3, 2); wclrtoeol(status_win);
                         box(status_win, 0, 0);
                         print_line_in_box(status_win, LINES - 3, 2, "Seeking %s on ch %u...", (seek_direction == 1) ? "Up" : "Down", new_channel);
-                        draw_status_pane(status_win, hd, selected_tuner, status_scroll_offset);
+                        draw_status_pane(status_win, tnr, status_scroll_offset);
                         mvwprintw(status_win, LINES - 2, 2, "<-/->: Ch | +/-: Seek | h: Help | q: Quit");
                         wrefresh(status_win);
 
                         bool lock_found = false;
                         for (int i = 0; i < 25; i++) {
-                            struct hdhomerun_tuner_status_t seek_status;
-                            char *raw_status;
-                            if (hdhomerun_device_get_tuner_status(hd, &raw_status, &seek_status) > 0) {
+                            struct tuner_status seek_status;
+                            if (tuner_get_status(tnr, &seek_status) > 0) {
                                 if (seek_status.signal_to_noise_quality > 0) {
                                     lock_found = true;
                                     break;
                                 }
                             }
                             
-                            draw_status_pane(status_win, hd, selected_tuner, status_scroll_offset);
+                            draw_status_pane(status_win, tnr, status_scroll_offset);
                             print_line_in_box(status_win, LINES - 3, 2, "Seeking %s on ch %u... (%2.1fs)", (seek_direction == 1) ? "Up" : "Down", new_channel, (25-i)/10.0);
                             mvwprintw(status_win, LINES - 2, 2, "<-/->: Ch | +/-: Seek | h: Help | q: Quit");
                             wrefresh(status_win);
@@ -1723,7 +1533,7 @@ int main_loop() {
                 end_seek:
                     wmove(status_win, LINES - 3, 2); wclrtoeol(status_win);
                     box(status_win, 0, 0);
-                    draw_status_pane(status_win, hd, selected_tuner, status_scroll_offset);
+                    draw_status_pane(status_win, tnr, status_scroll_offset);
                     mvwprintw(status_win, LINES - 2, 2, "<-/->: Ch | +/-: Seek | h: Help | q: Quit");
                     wrefresh(status_win);
                 }
@@ -1731,12 +1541,11 @@ int main_loop() {
 
             case KEY_LEFT:
             case KEY_RIGHT:
-                if (!hd) break;
+                if (!tnr) break;
                 {
                     unsigned int current_channel = 0, new_channel = 0;
-                    struct hdhomerun_tuner_status_t current_status;
-                    char *s;
-                    if (hdhomerun_device_get_tuner_status(hd, &s, &current_status) > 0) {
+                    struct tuner_status current_status;
+                    if (tuner_get_status(tnr, &current_status) > 0) {
                         char *p = strchr(current_status.channel, ':');
                         if (!p) p = current_status.channel; else p++;
                         if (isdigit((unsigned char)*p)) current_channel = strtoul(p, NULL, 10);
@@ -1763,7 +1572,7 @@ int main_loop() {
                     }
                     char tune_str[64];
                     sprintf(tune_str, "auto:%u", new_channel);
-                    hdhomerun_device_set_tuner_channel(hd, tune_str);
+                    tuner_set_channel(tnr, tune_str);
                     status_scroll_offset = 0;
                 }
                 break;
@@ -1772,12 +1581,11 @@ int main_loop() {
             case 'a':
             case 'x':
             case 'z':
-                if (!hd) break;
+                if (!tnr) break;
                 {
-                    struct hdhomerun_tuner_status_t status;
-                    char *raw_status_str;
+                    struct tuner_status status;
                     bool is_atsc3_save = false;
-                    if (hdhomerun_device_get_tuner_status(hd, &raw_status_str, &status) > 0) {
+                    if (tuner_get_status(tnr, &status) > 0) {
                         if (strstr(status.lock_str, "atsc3") != NULL) is_atsc3_save = true;
                     }
 
@@ -1791,13 +1599,13 @@ int main_loop() {
                     }
                     
                     if (action_valid) {
-                        persistent_message = save_stream(hd, status_win, mode, &tuners[highlight], debug_mode_enabled);
+                        persistent_message = save_stream(tnr, status_win, mode, debug_mode_enabled);
                     }
                 }
                 break;
 
             case 'c':
-                 if (!hd) break;
+                 if (!tnr) break;
                  {
                     char channel_str[20] = {0};
                     nodelay(stdscr, FALSE); echo();
@@ -1809,9 +1617,8 @@ int main_loop() {
                     if (strlen(channel_str) > 0) {
                         char full_tune_str[100];
                         sprintf(full_tune_str, "auto:%s", channel_str);
-                        hdhomerun_device_set_tuner_channel(hd, full_tune_str);
-                        struct hdhomerun_tuner_status_t lock_status;
-                        hdhomerun_device_wait_for_lock(hd, &lock_status);
+                        tuner_set_channel(tnr, full_tune_str);
+                        tuner_wait_for_lock(tnr);
                         status_scroll_offset = 0;
                     }
                  }
@@ -1819,7 +1626,7 @@ int main_loop() {
 
             case 'h':
                 if (show_help_screen(status_win) == 1) {
-                    if (hd) hdhomerun_device_destroy(hd);
+                    if (tnr) tuner_close(tnr);
                     delwin(tuner_win); delwin(status_win);
                     return 0;
                 }
@@ -1846,43 +1653,19 @@ int main_loop() {
                 break;
 
             case 'm': // Change channel map
-                 if (!hd) break;
+                 if (!tnr) break;
                  {
-                    char *features_str;
-                    if (hdhomerun_device_get_var(hd, "/sys/features", &features_str, NULL) <= 0) break;
-
-                    char *features_copy = strdup(features_str);
-                    char *map_line_start = strstr(features_copy, "channelmap:");
-                    if (!map_line_start) { free(features_copy); break; }
-
-                    char *map_line_end = strchr(map_line_start, '\n');
-                    if (map_line_end) *map_line_end = '\0';
-
                     char *map_names[MAX_MAPS];
-                    int map_count = 0;
-                    
-                    char *token = strtok(map_line_start, " ");
-                    while (token != NULL && map_count < MAX_MAPS) {
-                        if (strcmp(token, "channelmap:") != 0) {
-                            map_names[map_count++] = strdup(token);
-                        }
-                        token = strtok(NULL, " ");
-                    }
-                    free(features_copy);
+                    int map_count = tuner_get_channelmap_names(tnr, map_names, MAX_MAPS);
 
                     if (map_count > 0) {
                         int menu_start_y = 2;
                         wclear(status_win);
                         box(status_win, 0, 0);
 
-                        char *current_map_str;
-                        if (hdhomerun_device_get_tuner_channelmap(hd, &current_map_str) > 0) {
-                            char *current_map_copy = strdup(current_map_str);
-                            if(current_map_copy) {
-                                char *current_map_token = strtok(current_map_copy, " ");
-                                mvwprintw(status_win, menu_start_y, 2, "Current Map: %s", current_map_token);
-                                free(current_map_copy);
-                            }
+                        char current_map[64];
+                        if (tuner_get_channelmap(tnr, current_map, sizeof(current_map)) > 0) {
+                            mvwprintw(status_win, menu_start_y, 2, "Current Map: %s", current_map);
                         }
                         
                         mvwprintw(status_win, menu_start_y + 2, 2, "Select New Map:");
@@ -1899,7 +1682,7 @@ int main_loop() {
 
                         int choice = atoi(choice_str);
                         if (choice > 0 && choice <= map_count) {
-                            hdhomerun_device_set_tuner_channelmap(hd, map_names[choice - 1]);
+                            tuner_set_channelmap(tnr, map_names[choice - 1]);
                             chan_list.count = 0;
                             status_scroll_offset = 0;
                         }
@@ -1910,11 +1693,10 @@ int main_loop() {
                  break;
 
             case 'p':
-                 if (!hd) break;
+                 if (!tnr) break;
                  {
-                    struct hdhomerun_tuner_status_t current_status;
-                    char *s;
-                    if (hdhomerun_device_get_tuner_status(hd, &s, &current_status) > 0 && strstr(current_status.lock_str, "atsc3")) {
+                    struct tuner_status current_status;
+                    if (tuner_get_status(tnr, &current_status) > 0 && strstr(current_status.lock_str, "atsc3")) {
                         char freq_buffer[20] = {0};
                         const char *start = strchr(current_status.channel, ':');
                         if (start) {
@@ -1940,8 +1722,8 @@ int main_loop() {
                                 }
                                 plp_str_out[j] = '\0';
                             } else {
-                                char *plpinfo;
-                                if (hdhomerun_device_get_tuner_plpinfo(hd, &plpinfo) > 0) {
+                                const char *plpinfo;
+                                if (tuner_get_plpinfo(tnr, &plpinfo) > 0) {
                                     char *plpinfo_copy = strdup(plpinfo);
                                     if(plpinfo_copy) {
                                         char *line = strtok(plpinfo_copy, "\n");
@@ -1964,9 +1746,8 @@ int main_loop() {
                             if (strlen(plp_str_out) > 0) {
                                 char full_tune_str[100];
                                 sprintf(full_tune_str, "atsc3:%s:%s", freq_buffer, plp_str_out);
-                                hdhomerun_device_set_tuner_channel(hd, full_tune_str);
-                                struct hdhomerun_tuner_status_t lock_status;
-                                hdhomerun_device_wait_for_lock(hd, &lock_status);
+                                tuner_set_channel(tnr, full_tune_str);
+                                tuner_wait_for_lock(tnr);
                                 status_scroll_offset = 0;
                             }
                         }
@@ -1980,7 +1761,7 @@ int main_loop() {
             int status;
             if (waitpid(vlc_pid, &status, WNOHANG) == vlc_pid) {
                 // VLC has exited. Clean up.
-                hdhomerun_device_set_tuner_target(hd, "none");
+                tuner_clear_target(tnr);
                 vlc_pid = 0;
                 if (persistent_message) free(persistent_message);
                 persistent_message = strdup("VLC has been closed.");
@@ -2005,7 +1786,7 @@ int main_loop() {
  * add_manual_device
  * Prompts user for an IP, queries the device, and adds its tuners to the list.
  */
-void add_manual_device(WINDOW *win, struct unified_tuner tuners[], int *total_tuners) {
+void add_manual_device(WINDOW *win, struct tuner_info tuners[], int *total_tuners) {
     if (*total_tuners >= MAX_TUNERS_TOTAL) {
         mvwprintw(win, LINES - 3, 2, "Tuner list full. Cannot add more devices.");
         wrefresh(win);
@@ -2025,68 +1806,33 @@ void add_manual_device(WINDOW *win, struct unified_tuner tuners[], int *total_tu
     mvwprintw(win, LINES - 3, 2, "Connecting to %s...", ip_str);
     wrefresh(win);
 
-    struct hdhomerun_device_t *hd = hdhomerun_device_create_from_str(ip_str, NULL);
-    if (!hd) {
+    int added = 0;
+    uint32_t device_id = 0;
+    switch (tuner_add_by_address(ip_str, tuners, total_tuners, MAX_TUNERS_TOTAL, &added, &device_id)) {
+    case TUNER_ADD_BAD_ADDRESS:
         mvwprintw(win, LINES - 3, 2, "Error: Invalid IP format or device not found.");
         wrefresh(win); sleep(2);
         return;
-    }
-
-    // Use get_var to fetch /sys/model. 
-    // note: libhdhomerun manages the memory for model_str, we do NOT free it.
-    char *model_str;
-    if (hdhomerun_device_get_var(hd, "/sys/model", &model_str, NULL) <= 0) {
+    case TUNER_ADD_NO_RESPONSE:
         mvwprintw(win, LINES - 3, 2, "Error: Device at %s did not respond.", ip_str);
-        hdhomerun_device_destroy(hd);
         wrefresh(win); sleep(2);
         return;
-    }
-
-    uint32_t device_id = hdhomerun_device_get_device_id(hd);
-    
-    // Check for duplicates
-    for (int i = 0; i < *total_tuners; i++) {
-        if (tuners[i].device_id == device_id) {
-            mvwprintw(win, LINES - 3, 2, "Device %08X is already in the list.", device_id);
-            hdhomerun_device_destroy(hd);
-            wrefresh(win); sleep(2);
-            return;
-        }
-    }
-
-    // Determine if legacy (heuristic based on model string)
-    bool is_legacy = (strstr(model_str, "hdhomerun3") != NULL || strstr(model_str, "hdhomerun_") != NULL);
-    
-    // Count tuners by probing
-    int device_tuner_count = 0;
-    for (int i = 0; i < 8; i++) { // Max reasonable tuners to probe
-        if (hdhomerun_device_set_tuner(hd, i) < 0) break;
-        
-        // Double check validity by asking for status
-        struct hdhomerun_tuner_status_t status;
-        char *status_str;
-        if (hdhomerun_device_get_tuner_status(hd, &status_str, &status) <= 0) break;
-        
-        device_tuner_count++;
-    }
-
-    if (device_tuner_count > 0) {
-        int added = 0;
-        for (int i = 0; i < device_tuner_count && *total_tuners < MAX_TUNERS_TOTAL; i++) {
-            tuners[*total_tuners].device_id = device_id;
-            strcpy(tuners[*total_tuners].ip_str, ip_str);
-            tuners[*total_tuners].tuner_index = i;
-            tuners[*total_tuners].total_tuners_on_device = device_tuner_count;
-            tuners[*total_tuners].is_legacy = is_legacy;
-            (*total_tuners)++;
-            added++;
-        }
+    case TUNER_ADD_DUPLICATE:
+        mvwprintw(win, LINES - 3, 2, "Device %08X is already in the list.", device_id);
+        wrefresh(win); sleep(2);
+        return;
+    case TUNER_ADD_LIST_FULL:
+        mvwprintw(win, LINES - 3, 2, "Tuner list full. Cannot add more devices.");
+        wrefresh(win); sleep(2);
+        return;
+    case TUNER_ADD_OK:
         mvwprintw(win, LINES - 3, 2, "Added device %08X with %d tuners.", device_id, added);
-    } else {
+        break;
+    case TUNER_ADD_NO_TUNERS:
         mvwprintw(win, LINES - 3, 2, "No accessible tuners found on device.");
+        break;
     }
 
-    hdhomerun_device_destroy(hd);
     wrefresh(win);
     sleep(1);
 }
@@ -2116,6 +1862,7 @@ int main(int argc, char *argv[]) {
     cbreak();
     curs_set(0);
     start_color();
+    use_default_colors();
     
     // Enable keypad for function keys, etc.
     keypad(stdscr, TRUE);
@@ -2125,9 +1872,9 @@ int main(int argc, char *argv[]) {
     // accidental tuner/channel changes from scroll wheel input.
     mousemask(BUTTON4_PRESSED | BUTTON5_PRESSED, NULL);
 
-    init_pair(1, COLOR_RED, COLOR_BLACK);
-    init_pair(2, COLOR_YELLOW, COLOR_BLACK);
-    init_pair(3, COLOR_GREEN, COLOR_BLACK);
+    init_pair(1, COLOR_RED, -1);
+    init_pair(2, COLOR_YELLOW, -1);
+    init_pair(3, COLOR_GREEN, -1);
 
     while (1) {
         int result = main_loop();
@@ -2136,7 +1883,7 @@ int main(int argc, char *argv[]) {
         }
         // If result is 1 (no devices), show message and wait for input
         clear();
-        mvprintw(LINES / 2, (COLS - 28) / 2, "No HDHomeRun devices found.");
+        mvprintw(LINES / 2, (COLS - 16) / 2, "No tuners found.");
         mvprintw(LINES / 2 + 2, (COLS - 40) / 2, "Press 'r' to refresh, or 'q' to quit.");
         refresh();
         nodelay(stdscr, FALSE);
@@ -2153,13 +1900,13 @@ int main(int argc, char *argv[]) {
 /*
  * Modified show_plp_details_screen function - much simpler now
  */
-int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd, struct unified_tuner *tuner_info) {
+int show_plp_details_screen(WINDOW *parent_win, struct tuner *tnr) {
     // Create detail info structure
     struct l1_detail_info* detail_info = create_l1_detail_info(MAX_DISPLAY_LINES);
     if (!detail_info) return 0;
     
     // Collect the details using the abstracted function
-    if (collect_atsc3_details(hd, tuner_info->tuner_index, detail_info) != 0) {
+    if (collect_atsc3_details(tnr, detail_info) != 0) {
         free_l1_detail_info(detail_info);
         return 0;
     }
@@ -2217,23 +1964,23 @@ int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd, s
                     unsigned int rf_channel = 0;
                     long id_val = -999;
 
-                    char *status_str_s, *plpinfo_str_s, *streaminfo_str_s;
-                    struct hdhomerun_tuner_status_t status_s;
+                    const char *plpinfo_str_s, *streaminfo_str_s;
+                    struct tuner_status status_s;
                     
-                    if (hdhomerun_device_get_tuner_status(hd, &status_str_s, &status_s) > 0) {
+                    if (tuner_get_status(tnr, &status_s) > 0) {
                         char *p = strchr(status_s.channel, ':');
                         if (!p) p = status_s.channel; else p++;
                         if (isdigit((unsigned char)*p)) rf_channel = strtoul(p, NULL, 10);
                     }
                     
-                    if (hdhomerun_device_get_tuner_streaminfo(hd, &streaminfo_str_s) > 0) {
+                    if (tuner_get_streaminfo(tnr, &streaminfo_str_s) > 0) {
                         char *si_copy = strdup(streaminfo_str_s);
                         if (si_copy) {
                             id_val = parse_status_value_l1(si_copy, "tsid=");
                             free(si_copy);
                         }
                     }
-                    if (hdhomerun_device_get_tuner_plpinfo(hd, &plpinfo_str_s) > 0) {
+                    if (tuner_get_plpinfo(tnr, &plpinfo_str_s) > 0) {
                         char *pi_copy = strdup(plpinfo_str_s);
                         if(pi_copy) {
                             long bsid_s = parse_status_value_l1(pi_copy, "bsid=");
@@ -2246,8 +1993,8 @@ int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd, s
                     char filename[256];
                     char time_str[20];
                     time_t now = time(NULL);
-                    struct tm *t = localtime(&now);
-                    strftime(time_str, sizeof(time_str)-1, "%Y%m%d-%H%M%S", t);
+                    struct tm *tm_now = localtime(&now);
+                    strftime(time_str, sizeof(time_str)-1, "%Y%m%d-%H%M%S", tm_now);
                     sprintf(filename, "rf%u-bsid%ld-details-%s.txt", rf_channel, id_val, time_str);
                     
                     if (save_atsc3_details_to_file(filename, detail_info, NULL) == 0) {
