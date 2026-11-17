@@ -1875,39 +1875,62 @@ void add_manual_device(WINDOW *win, struct tuner_info tuners[], int *total_tuner
     sleep(1);
 }
 
+static void print_usage(const char *prog) {
+    printf("HDHomeRun TUI v%s\n", TUI_VERSION);
+    printf("Usage: %s [options]\n\n", prog);
+    printf("  -i, --ip <ip>       Connect directly to the HDHomeRun at <ip>, skipping discovery\n");
+    printf("  -d, --device <id>   Only list the HDHomeRun with this device ID (hex, e.g. 1234ABCD)\n");
+    printf("  -v, --verbose       Write a debug log to %s in the current directory\n", DEBUG_LOG_FILE);
+    printf("  -h, --help          Show this help message\n");
+}
+
 /*
  * main
  * Entry point of the application.
  */
 int main(int argc, char *argv[]) {
     // Parse command line arguments
+    static const struct option long_options[] = {
+        {"ip",      required_argument, NULL, 'i'},
+        {"device",  required_argument, NULL, 'd'},
+        {"verbose", no_argument,       NULL, 'v'},
+        {"help",    no_argument,       NULL, 'h'},
+        {NULL, 0, NULL, 0}
+    };
     bool verbose = false;
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
-            g_initial_ip = argv[i + 1];
-            i++; // Skip the IP argument
-        } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
-            const char *arg = argv[++i];
+    int opt;
+    while ((opt = getopt_long(argc, argv, "i:d:vh", long_options, NULL)) != -1) {
+        switch (opt) {
+        case 'i':
+            g_initial_ip = optarg;
+            break;
+        case 'd': {
             char *end;
             errno = 0;
-            unsigned long id = strtoul(arg, &end, 16);
-            if (errno || *arg == '\0' || *end != '\0' || id == 0 || id > 0xFFFFFFFFUL) {
-                fprintf(stderr, "%s: invalid device ID '%s' (expected hex, e.g. 1234ABCD)\n", argv[0], arg);
+            unsigned long id = strtoul(optarg, &end, 16);
+            if (errno || *optarg == '\0' || *end != '\0' || id == 0 || id > 0xFFFFFFFFUL) {
+                fprintf(stderr, "%s: invalid device ID '%s' (expected hex, e.g. 1234ABCD)\n", argv[0], optarg);
                 return 1;
             }
             g_device_filter = (uint32_t)id;
             g_device_filter_set = true;
-        } else if (strcmp(argv[i], "-v") == 0) {
-            verbose = true;
-        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            printf("HDHomeRun TUI v%s\n", TUI_VERSION);
-            printf("Usage: %s [-i <ip_address>] [-d <device_id>] [-v]\n", argv[0]);
-            printf("  -i <ip>  : Connect directly to device at IP, skip discovery\n");
-            printf("  -d <id>  : Only list the HDHomeRun with this device ID (hex)\n");
-            printf("  -v       : Write a debug log to %s\n", DEBUG_LOG_FILE);
-            printf("  -h       : Show this help message\n");
-            return 0;
+            break;
         }
+        case 'v':
+            verbose = true;
+            break;
+        case 'h':
+            print_usage(argv[0]);
+            return 0;
+        default:   // getopt_long has already printed the error
+            print_usage(argv[0]);
+            return 1;
+        }
+    }
+    if (optind < argc) {
+        fprintf(stderr, "%s: unexpected argument '%s'\n", argv[0], argv[optind]);
+        print_usage(argv[0]);
+        return 1;
     }
 
     if (verbose) {
