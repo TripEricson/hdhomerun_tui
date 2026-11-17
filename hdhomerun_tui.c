@@ -123,6 +123,28 @@ int run_capture(struct tuner *t, enum tuner_capture_format fmt, unsigned rf_chan
 // Global variable to hold initial IP from command line (-i option)
 static char *g_initial_ip = NULL;
 
+// HDHomeRun device ID from the command line (-d option). When set, only that
+// HDHomeRun's tuners are listed (local USB tuners are still shown), including
+// after a rediscover with 'r'.
+static bool g_device_filter_set = false;
+static uint32_t g_device_filter = 0;
+
+/*
+ * filter_tuner_list
+ * Drops HDHomeRun tuners that don't belong to the -d device. Returns the new count.
+ */
+static int filter_tuner_list(struct tuner_info tuners[], int count) {
+    if (!g_device_filter_set) return count;
+    int kept = 0;
+    for (int i = 0; i < count; i++) {
+        if (tuners[i].kind == TUNER_KIND_HDHR && tuners[i].device_id != g_device_filter)
+            continue;
+        if (kept != i) tuners[kept] = tuners[i];
+        kept++;
+    }
+    return kept;
+}
+
 /*
  * add_device_by_ip
  * Queries a device by IP and adds its tuners to the list. No UI required.
@@ -141,10 +163,14 @@ int add_device_by_ip(const char *ip_str, struct tuner_info tuners[], int *total_
  */
 int discover_and_build_tuner_list(struct tuner_info tuners[]) {
     clear();
-    mvprintw(0, 0, "Discovering tuners...");
+    if (g_device_filter_set)
+        mvprintw(0, 0, "Discovering tuners (HDHomeRun %08X)...", g_device_filter);
+    else
+        mvprintw(0, 0, "Discovering tuners...");
     refresh();
 
     int total_tuner_count = tuner_discover(tuners, MAX_TUNERS_TOTAL);
+    total_tuner_count = filter_tuner_list(tuners, total_tuner_count);
 
     clear();
     refresh();
@@ -1847,10 +1873,22 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
             g_initial_ip = argv[i + 1];
             i++; // Skip the IP argument
+        } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
+            const char *arg = argv[++i];
+            char *end;
+            errno = 0;
+            unsigned long id = strtoul(arg, &end, 16);
+            if (errno || *arg == '\0' || *end != '\0' || id == 0 || id > 0xFFFFFFFFUL) {
+                fprintf(stderr, "%s: invalid device ID '%s' (expected hex, e.g. 1234ABCD)\n", argv[0], arg);
+                return 1;
+            }
+            g_device_filter = (uint32_t)id;
+            g_device_filter_set = true;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printf("HDHomeRun TUI v%s\n", TUI_VERSION);
-            printf("Usage: %s [-i <ip_address>]\n", argv[0]);
+            printf("Usage: %s [-i <ip_address>] [-d <device_id>]\n", argv[0]);
             printf("  -i <ip>  : Connect directly to device at IP, skip discovery\n");
+            printf("  -d <id>  : Only list the HDHomeRun with this device ID (hex)\n");
             printf("  -h       : Show this help message\n");
             return 0;
         }
@@ -1883,7 +1921,10 @@ int main(int argc, char *argv[]) {
         }
         // If result is 1 (no devices), show message and wait for input
         clear();
-        mvprintw(LINES / 2, (COLS - 16) / 2, "No tuners found.");
+        if (g_device_filter_set)
+            mvprintw(LINES / 2, (COLS - 26) / 2, "HDHomeRun %08X not found.", g_device_filter);
+        else
+            mvprintw(LINES / 2, (COLS - 16) / 2, "No tuners found.");
         mvprintw(LINES / 2 + 2, (COLS - 40) / 2, "Press 'r' to refresh, or 'q' to quit.");
         refresh();
         nodelay(stdscr, FALSE);
