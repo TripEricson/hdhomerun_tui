@@ -47,6 +47,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <getopt.h>
 #include <ctype.h>
 #include <stdarg.h>
 #include <time.h>
@@ -65,6 +66,7 @@
 
 #include "l1_details.h"
 #include "tuner.h"
+#include "debug_log.h"
 
 #define MAX_DEVICES 10
 #define MAX_TUNERS_TOTAL 32 // Max combined tuners from all devices
@@ -123,6 +125,34 @@ int run_capture(struct tuner *t, enum tuner_capture_format fmt, unsigned rf_chan
 // Global variable to hold initial IP from command line (-i option)
 static char *g_initial_ip = NULL;
 
+// Debug log written when -v is given
+#define DEBUG_LOG_FILE "hdhomerun_tui.log"
+
+// HDHomeRun device ID from the command line (-d option). When set, only that
+// HDHomeRun's tuners are listed (local USB tuners are still shown), including
+// after a rediscover with 'r'.
+static bool g_device_filter_set = false;
+static uint32_t g_device_filter = 0;
+
+/*
+ * filter_tuner_list
+ * Drops HDHomeRun tuners that don't belong to the -d device. Returns the new count.
+ */
+static int filter_tuner_list(struct tuner_info tuners[], int count) {
+    if (!g_device_filter_set) return count;
+    int kept = 0;
+    for (int i = 0; i < count; i++) {
+        if (tuners[i].kind == TUNER_KIND_HDHR && tuners[i].device_id != g_device_filter) {
+            log_debug("filter: skipping %s (not %08X)", tuners[i].name, g_device_filter);
+            continue;
+        }
+        if (kept != i) tuners[kept] = tuners[i];
+        kept++;
+    }
+    log_debug("filter: kept %d of %d tuner(s)", kept, count);
+    return kept;
+}
+
 /*
  * add_device_by_ip
  * Queries a device by IP and adds its tuners to the list. No UI required.
@@ -131,7 +161,8 @@ static char *g_initial_ip = NULL;
 int add_device_by_ip(const char *ip_str, struct tuner_info tuners[], int *total_tuners) {
     int added = 0;
     uint32_t device_id;
-    tuner_add_by_address(ip_str, tuners, total_tuners, MAX_TUNERS_TOTAL, &added, &device_id);
+    enum tuner_add_result r = tuner_add_by_address(ip_str, tuners, total_tuners, MAX_TUNERS_TOTAL, &added, &device_id);
+    log_debug("add_device_by_ip(%s): result %d, %d tuner(s) added", ip_str, (int)r, added);
     return added;
 }
 
@@ -141,10 +172,16 @@ int add_device_by_ip(const char *ip_str, struct tuner_info tuners[], int *total_
  */
 int discover_and_build_tuner_list(struct tuner_info tuners[]) {
     clear();
-    mvprintw(0, 0, "Discovering tuners...");
+    if (g_device_filter_set)
+        mvprintw(0, 0, "Discovering tuners (HDHomeRun %08X)...", g_device_filter);
+    else
+        mvprintw(0, 0, "Discovering tuners...");
     refresh();
 
+    log_debug("Discovering tuners");
     int total_tuner_count = tuner_discover(tuners, MAX_TUNERS_TOTAL);
+    log_debug("Discovery found %d tuner(s)", total_tuner_count);
+    total_tuner_count = filter_tuner_list(tuners, total_tuner_count);
 
     clear();
     refresh();
@@ -1400,6 +1437,7 @@ int main_loop() {
                 return 0;
 
             case 'r':
+                log_debug("User requested rediscover");
                 if (vlc_pid > 0) { 
                     kill(vlc_pid, SIGTERM); 
                     waitpid(vlc_pid, NULL, 0); 
@@ -1837,23 +1875,72 @@ void add_manual_device(WINDOW *win, struct tuner_info tuners[], int *total_tuner
     sleep(1);
 }
 
+static void print_usage(const char *prog) {
+    printf("HDHomeRun TUI v%s\n", TUI_VERSION);
+    printf("Usage: %s [options]\n\n", prog);
+    printf("  -i, --ip <ip>       Connect directly to the HDHomeRun at <ip>, skipping discovery\n");
+    printf("  -d, --device <id>   Only list the HDHomeRun with this device ID (hex, e.g. 1234ABCD)\n");
+    printf("  -v, --verbose       Write a debug log to %s in the current directory\n", DEBUG_LOG_FILE);
+    printf("  -h, --help          Show this help message\n");
+}
+
 /*
  * main
  * Entry point of the application.
  */
 int main(int argc, char *argv[]) {
     // Parse command line arguments
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
-            g_initial_ip = argv[i + 1];
-            i++; // Skip the IP argument
-        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            printf("HDHomeRun TUI v%s\n", TUI_VERSION);
-            printf("Usage: %s [-i <ip_address>]\n", argv[0]);
-            printf("  -i <ip>  : Connect directly to device at IP, skip discovery\n");
-            printf("  -h       : Show this help message\n");
-            return 0;
+    static const struct option long_options[] = {
+        {"ip",      required_argument, NULL, 'i'},
+        {"device",  required_argument, NULL, 'd'},
+        {"verbose", no_argument,       NULL, 'v'},
+        {"help",    no_argument,       NULL, 'h'},
+        {NULL, 0, NULL, 0}
+    };
+    bool verbose = false;
+    int opt;
+    while ((opt = getopt_long(argc, argv, "i:d:vh", long_options, NULL)) != -1) {
+        switch (opt) {
+        case 'i':
+            g_initial_ip = optarg;
+            break;
+        case 'd': {
+            char *end;
+            errno = 0;
+            unsigned long id = strtoul(optarg, &end, 16);
+            if (errno || *optarg == '\0' || *end != '\0' || id == 0 || id > 0xFFFFFFFFUL) {
+                fprintf(stderr, "%s: invalid device ID '%s' (expected hex, e.g. 1234ABCD)\n", argv[0], optarg);
+                return 1;
+            }
+            g_device_filter = (uint32_t)id;
+            g_device_filter_set = true;
+            break;
         }
+        case 'v':
+            verbose = true;
+            break;
+        case 'h':
+            print_usage(argv[0]);
+            return 0;
+        default:   // getopt_long has already printed the error
+            print_usage(argv[0]);
+            return 1;
+        }
+    }
+    if (optind < argc) {
+        fprintf(stderr, "%s: unexpected argument '%s'\n", argv[0], argv[optind]);
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    if (verbose) {
+        if (!debug_log_open(DEBUG_LOG_FILE)) {
+            fprintf(stderr, "%s: cannot open %s: %s\n", argv[0], DEBUG_LOG_FILE, strerror(errno));
+            return 1;
+        }
+        log_debug("=== HDHomeRun TUI v%s debug log started ===", TUI_VERSION);
+        if (g_initial_ip) log_debug("Option -i %s", g_initial_ip);
+        if (g_device_filter_set) log_debug("Option -d %08X", g_device_filter);
     }
 
     initscr();
@@ -1883,7 +1970,11 @@ int main(int argc, char *argv[]) {
         }
         // If result is 1 (no devices), show message and wait for input
         clear();
-        mvprintw(LINES / 2, (COLS - 16) / 2, "No tuners found.");
+        log_debug("No tuners found");
+        if (g_device_filter_set)
+            mvprintw(LINES / 2, (COLS - 26) / 2, "HDHomeRun %08X not found.", g_device_filter);
+        else
+            mvprintw(LINES / 2, (COLS - 16) / 2, "No tuners found.");
         mvprintw(LINES / 2 + 2, (COLS - 40) / 2, "Press 'r' to refresh, or 'q' to quit.");
         refresh();
         nodelay(stdscr, FALSE);
@@ -1894,6 +1985,8 @@ int main(int argc, char *argv[]) {
     }
 
     endwin();
+    log_debug("=== HDHomeRun TUI exiting ===");
+    debug_log_close();
     return 0;
 }
 

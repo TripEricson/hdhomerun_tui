@@ -56,8 +56,12 @@ USB tuners based on the Sony CXD28xx chips, such as the GT Media/Zenview HDTV Ma
 ```bash
 ./hdhomerun_tui            # discover tuners automatically
 ./hdhomerun_tui -i <ip>    # connect straight to a device by IP, skipping discovery
+./hdhomerun_tui -d <id>    # only list the HDHomeRun with this device ID (e.g. 1234ABCD); USB tuners still show
+./hdhomerun_tui -v         # write a debug log to hdhomerun_tui.log (combine with -i to troubleshoot)
 ./hdhomerun_tui -h         # show command-line help
 ```
+
+The long forms `--ip`, `--device`, `--verbose` and `--help` also work, and options can be combined, e.g. `-v -i 192.168.1.100` to troubleshoot a connection to a device on another subnet.
 
 Captures and detail files are saved in the current directory, with names built from the RF channel, the TSID or BSID, the PLPs and the time.
 
