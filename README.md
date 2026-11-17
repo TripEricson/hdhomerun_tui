@@ -56,6 +56,7 @@ USB tuners based on the Sony CXD28xx chips, such as the GT Media/Zenview HDTV Ma
 ```bash
 ./hdhomerun_tui            # discover tuners automatically
 ./hdhomerun_tui -i <ip>    # connect straight to a device by IP, skipping discovery
+./hdhomerun_tui -v         # write a debug log to hdhomerun_tui.log (combine with -i to troubleshoot)
 ./hdhomerun_tui -h         # show command-line help
 ```
 
