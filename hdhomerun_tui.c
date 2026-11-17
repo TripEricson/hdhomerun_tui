@@ -47,6 +47,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <getopt.h>
 #include <ctype.h>
 #include <stdarg.h>
 #include <time.h>
@@ -1837,23 +1838,42 @@ void add_manual_device(WINDOW *win, struct tuner_info tuners[], int *total_tuner
     sleep(1);
 }
 
+static void print_usage(const char *prog) {
+    printf("HDHomeRun TUI v%s\n", TUI_VERSION);
+    printf("Usage: %s [options]\n\n", prog);
+    printf("  -i, --ip <ip>   Connect directly to the HDHomeRun at <ip>, skipping discovery\n");
+    printf("  -h, --help      Show this help message\n");
+}
+
 /*
  * main
  * Entry point of the application.
  */
 int main(int argc, char *argv[]) {
     // Parse command line arguments
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
-            g_initial_ip = argv[i + 1];
-            i++; // Skip the IP argument
-        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            printf("HDHomeRun TUI v%s\n", TUI_VERSION);
-            printf("Usage: %s [-i <ip_address>]\n", argv[0]);
-            printf("  -i <ip>  : Connect directly to device at IP, skip discovery\n");
-            printf("  -h       : Show this help message\n");
+    static const struct option long_options[] = {
+        {"ip",   required_argument, NULL, 'i'},
+        {"help", no_argument,       NULL, 'h'},
+        {NULL, 0, NULL, 0}
+    };
+    int opt;
+    while ((opt = getopt_long(argc, argv, "i:h", long_options, NULL)) != -1) {
+        switch (opt) {
+        case 'i':
+            g_initial_ip = optarg;
+            break;
+        case 'h':
+            print_usage(argv[0]);
             return 0;
+        default:   // getopt_long has already printed the error
+            print_usage(argv[0]);
+            return 1;
         }
+    }
+    if (optind < argc) {
+        fprintf(stderr, "%s: unexpected argument '%s'\n", argv[0], argv[optind]);
+        print_usage(argv[0]);
+        return 1;
     }
 
     initscr();
