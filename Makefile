@@ -44,8 +44,8 @@ LIB_OBJS = $(LIB_SRCS:.c=.o)
 # interface. Backends: tuner_hdhr.c (the only file that uses libhdhomerun)
 # and tuner_cxd28xx.c (USB tuners on the cxd28xx driver, via /dev/dvb and
 # /dev/alpraw).
-APP_SRCS = hdhomerun_tui.c l1_detail_parser.c l1_details.c tuner.c tuner_hdhr.c tuner_cxd28xx.c
-APP_HDRS = l1_detail_parser.h l1_details.h tuner.h atsc3_tables.h alp_raw.h
+APP_SRCS = hdhomerun_tui.c debug_log.c l1_detail_parser.c l1_details.c tuner.c tuner_hdhr.c tuner_cxd28xx.c
+APP_HDRS = debug_log.h l1_detail_parser.h l1_details.h tuner.h atsc3_tables.h alp_raw.h
 APP_OBJS = $(APP_SRCS:.c=.o)
 
 # Default target

@@ -27,6 +27,7 @@
 #include "hdhomerun.h"
 #include "hdhomerun_device.h"
 #include "tuner.h"
+#include "debug_log.h"
 
 // Firmware from this date on reports /tunerN/l1detail
 #define L1DETAIL_MIN_FIRMWARE 20250623
@@ -106,10 +107,15 @@ static void fill_info(struct tuner_info *ti, uint32_t device_id, const char *ip_
 static int hdhr_discover(struct tuner_info list[], int max)
 {
     struct hdhomerun_discover_t *ds = hdhomerun_discover_create(NULL);
-    if (!ds) return 0;
+    if (!ds) {
+        log_debug("hdhr: failed to create discovery object");
+        return 0;
+    }
 
     uint32_t device_types[1] = { HDHOMERUN_DEVICE_TYPE_TUNER };
+    log_debug("hdhr: broadcasting discovery request");
     if (hdhomerun_discover2_find_devices_broadcast(ds, HDHOMERUN_DISCOVER_FLAGS_IPV4_GENERAL, device_types, 1) < 0) {
+        log_debug("hdhr: discovery broadcast failed");
         hdhomerun_discover_destroy(ds);
         return 0;
     }
@@ -126,6 +132,8 @@ static int hdhr_discover(struct tuner_info list[], int max)
         struct sockaddr_storage ip_address;
         hdhomerun_discover2_device_if_get_ip_addr(device_if, &ip_address);
         hdhomerun_sock_sockaddr_to_ip_str(ip_str, (struct sockaddr *)&ip_address, true);
+        log_debug("hdhr: found device %08X at %s, %d tuner(s)%s",
+                  device_id, ip_str, tuner_count, is_legacy ? ", legacy" : "");
 
         for (int i = 0; i < tuner_count && n < max; i++)
             fill_info(&list[n++], device_id, ip_str, i, tuner_count, is_legacy);
@@ -134,6 +142,7 @@ static int hdhr_discover(struct tuner_info list[], int max)
     }
 
     hdhomerun_discover_destroy(ds);
+    log_debug("hdhr: discovery found %d tuner(s)", n);
     return n;
 }
 
@@ -144,15 +153,22 @@ static enum tuner_add_result hdhr_add_by_address(const char *ip_str, struct tune
     *added = 0;
     if (*count >= max) return TUNER_ADD_LIST_FULL;
 
+    log_debug("hdhr: adding device by address %s", ip_str);
     struct hdhomerun_device_t *hd = hdhomerun_device_create_from_str(ip_str, NULL);
-    if (!hd) return TUNER_ADD_BAD_ADDRESS;
+    if (!hd) {
+        log_debug("hdhr: '%s' is not a usable address", ip_str);
+        return TUNER_ADD_BAD_ADDRESS;
+    }
 
     // libhdhomerun manages the memory for model_str; not freed here
     char *model_str;
     if (hdhomerun_device_get_var(hd, "/sys/model", &model_str, NULL) <= 0) {
+        log_debug("hdhr: no response from %s", ip_str);
         hdhomerun_device_destroy(hd);
         return TUNER_ADD_NO_RESPONSE;
     }
+
+    log_debug("hdhr: %s responded, model %s", ip_str, model_str);
 
     uint32_t device_id = hdhomerun_device_get_device_id(hd);
     if (device_id_out) *device_id_out = device_id;
@@ -176,6 +192,7 @@ static enum tuner_add_result hdhr_add_by_address(const char *ip_str, struct tune
         if (hdhomerun_device_get_tuner_status(hd, &status_str, &status) <= 0) break;
         device_tuner_count++;
     }
+    log_debug("hdhr: %s is device %08X, %d tuner(s)", ip_str, device_id, device_tuner_count);
     hdhomerun_device_destroy(hd);
 
     if (device_tuner_count == 0) return TUNER_ADD_NO_TUNERS;
@@ -196,10 +213,12 @@ static struct tuner *hdhr_open(const struct tuner_info *info)
     // broadcast discovery
     ht->hd = hdhomerun_device_create_from_str(info->addr, NULL);
     if (!ht->hd) {
+        log_debug("hdhr: failed to open %s at %s", info->name, info->addr);
         free(ht);
         return NULL;
     }
     hdhomerun_device_set_tuner(ht->hd, info->tuner_index);
+    log_debug("hdhr: opened %s at %s", info->name, info->addr);
     return &ht->base;
 }
 
